@@ -1,339 +1,416 @@
-############################################
-##### Pre-Imputation Processing and QC #####
-############################################
+################################################################################
+#                                                                              #
+#                    PRE-IMPUTATION PROCESSING AND QC PIPELINE                 #
+#                                                                              #
+################################################################################
 
-## ============================================================================
-## METADATA (EDIT FOR YOUR DATASET)
-## ============================================================================
+# ==============================================================================
+# METADATA (EDIT FOR YOUR DATASET)
+# ==============================================================================
 
-## Analyst:
-## Name of data:
-## Location:
-## Genome build:
-## Platform:
-## Strand:
-## Number variants:
-## Number of samples:
-## Original filename:
+# Analyst:          [Your Name]
+# Data name:        [Dataset Name]
+# Location:         [Storage Path]
+# Genome build:     hg19/GRCh37
+# Platform:         Illumina/Affymetrix
+# Strand:           Plus/Minus
+# Variants:         [Number]
+# Samples:          [Number]
+# Original file:    [Filename]
 
-## ============================================================================
-## LOAD LIBRARIES
-## ============================================================================
+# ==============================================================================
+# 0. SETUP - Load libraries & create directories
+# ==============================================================================
 
-library(data.table)   # Fast file I/O for large genetic data
-library(ggplot2)      # Visualization
-library(tidyverse)    # Data manipulation
-library(foreach)      # Parallel processing
+# Load required packages
+library(data.table)
+library(ggplot2)
+library(tidyverse)
 
+# Create directory structure
+dirs <- c("logs", "temp", "output", "figures")
+for(d in dirs) {
+  if(!dir.exists(d)) dir.create(d)
+}
 
-## ============================================================================
-## EXAMINE ORIGINAL DATA
-## ============================================================================
+# Set paths (MODIFY THESE)
+INPUT_PREFIX <- "filepath-to-original-data/data"
+OUTPUT_PREFIX <- "data_37"
+REF_1KG <- "/projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/IMPUTE2_temp_1kg_Reference_All_Biallelic_SNPS"
+HRC_SCRIPT <- "/projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC-1000G-check-bim-v4.3.0/HRC-1000G-check-bim.pl"
 
-## Check total number of variants
+# QC thresholds
+GENO_THRESH <- 0.05   # Remove SNPs missing in >5% of samples
+MAF_PRE <- 0.10       # Pre-imputation MAF threshold (keep SNPs with >10% MAF)
+MAF_POST <- 0.01      # Post-imputation MAF threshold
+MIND_THRESH <- 0.10   # Remove samples missing >10% of genotypes
+
+# ==============================================================================
+# 1. EXAMINE ORIGINAL DATA
+# ==============================================================================
+
+cat("\n========== STEP 1: Examining original data ==========\n")
+
+# Check file sizes and counts
 system("wc -l filepath-to-original-data/data.bim")
+system("wc -l filepath-to-original-data/data.fam")
 
-## Look at markers in data -- check build using dbSNP: https://www.ncbi.nlm.nih.gov/snp/
+# Look at first few variants
 bim <- fread("filepath-to-original-data/data.bim")
-bim[3000:3010,]  # Look in middle of file, not just head
+cat("\nFirst 5 variants:\n")
+print(head(bim, 5))
+cat("\nVariants 3000-3010:\n")
+print(bim[3000:3010, ])
 
-## Run BIM file through Chipendium to determine platform:
-## http://mccarthy.well.ox.ac.uk/chipendium/ui/
-
-## Look at FAM file structure
+# Check sample info
 fam <- fread("filepath-to-original-data/data.fam")
-head(fam)
-nrow(fam)  # Number of samples
+cat("\nFirst 5 samples:\n")
+print(head(fam))
+cat("\nTotal samples:", nrow(fam), "\n")
 
+# ==============================================================================
+# 2. LIFT DATA TO NCBI37 (if needed)
+# ==============================================================================
 
-## ============================================================================
-## STEP 0: LIFT DATA TO NCBI37 (if needed)
-## ============================================================================
+cat("\n========== STEP 2: Lifting to build 37 ==========\n")
 
-## Download strand files from: http://www.well.ox.ac.uk/~wrayner/strand/sourceStrand/index.html
-## Usage: update_build.sh <bed-stem> <strand-file> <output-stem>
+# Option A: If you need to lift from build 38 to 37
+# system("sh /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/update_build.sh original_data /path/to/strand.file data_37")
 
-system("sh /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/update_build.sh original_data PATH-TO-STRAND-FILE data_37")
+# Option B: Just standardize existing build 37 files
+system(paste("plink --bfile", INPUT_PREFIX, "--make-bed --out", OUTPUT_PREFIX))
 
-## If no lift needed, run through PLINK to standardize
-system("plink --bfile filepath-to-original-data/data --make-bed --out data_37")
+# Verify output
+cat("\nAfter lift/standardization:\n")
+system(paste("wc -l", paste0(OUTPUT_PREFIX, ".fam")))
+system(paste("wc -l", paste0(OUTPUT_PREFIX, ".bim")))
 
-system("wc -l data_37.fam")  # Verify sample count
-system("wc -l data_37.bim")  # Verify variant count
+# ==============================================================================
+# 3. BASIC QUALITY CONTROL
+# ==============================================================================
 
+cat("\n========== STEP 3: Basic QC ==========\n")
 
-## ============================================================================
-## STEP 1: QC THE SAMPLE DATA
-## ============================================================================
+# Step 3.1: Remove SNPs with low genotyping rate (>5% missing)
+system(paste("plink --bfile", OUTPUT_PREFIX, 
+             "--geno", GENO_THRESH, 
+             "--threads 20", 
+             "--make-bed --out temp_geno"))
 
-## Remove SNPs with genotyping rate < 95% (missing in >5% of samples)
-system("plink --bfile data_37 --geno 0.05 --threads 20 --make-bed --out temp_data_37_geno")
+# Step 3.2: Keep only common variants (MAF > 10%)
+system(paste("plink --bfile temp_geno", 
+             "--maf", MAF_PRE, 
+             "--threads 20", 
+             "--make-bed --out temp_maf"))
 
-## Keep only SNPs with MAF > 10% (pre-imputation threshold)
-system("plink --bfile temp_data_37_geno --maf 0.1 --threads 20 --make-bed --out temp_data_37_maf")
+# Check results
+cat("\nAfter QC:\n")
+system(paste("wc -l temp_maf.fam"))  # Samples remaining
+system(paste("wc -l temp_maf.bim"))  # Variants remaining
 
-system("wc -l temp_data_37_maf.fam")  # Remaining samples
-system("wc -l temp_data_37_maf.bim")  # Remaining variants
+# ==============================================================================
+# 4. FIND OVERLAPPING SNPS WITH 1000 GENOMES REFERENCE
+# ==============================================================================
 
+cat("\n========== STEP 4: Finding overlapping SNPs with 1000G ==========\n")
 
-## ============================================================================
-## STEP 2: MERGE REFERENCE AND SAMPLE DATA TO IDENTIFY OVERLAPPING SNPs
-## ============================================================================
+# Load reference SNPs
+kg_bim <- fread(paste0(REF_1KG, ".bim"))
+kg_snps <- kg_bim$V2
+cat("Reference SNPs:", length(kg_snps), "\n")
 
-## 1000 Genomes LD pruned reference file
-kg_bim <- fread("/projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/IMPUTE2_temp_1kg_Reference_All_Biallelic_SNPS.bim")
-dim(kg_bim)  # 2,050,463 variants
-kg_bim_snps <- as.matrix(kg_bim$V2)
+# Load data SNPs
+data_bim <- fread("temp_maf.bim")
+data_snps <- data_bim$V2
+cat("Data SNPs:", length(data_snps), "\n")
 
-## Read sample BIM
-data_bim <- fread("temp_data_37_maf.bim")
-data_bim_snps <- as.matrix(data_bim$V2)
+# Find overlap
+overlap <- kg_snps[kg_snps %in% data_snps]
+cat("Overlapping SNPs:", length(overlap), 
+    sprintf("(%.1f%% of reference)", 100 * length(overlap)/length(kg_snps)), "\n")
 
-## Determine overlap between 1KG and sample
-table(kg_bim_snps %in% data_bim_snps)
-overlap <- kg_bim_snps[kg_bim_snps %in% data_bim_snps]
-length(overlap)
+# Save overlapping SNP list
+fwrite(list(overlap), "overlapping_snps.txt", sep = "\t", quote = FALSE, col.names = FALSE)
 
-## Save overlapping SNPs list
-fwrite(as.list(overlap), "data_updated_temp_1kg_ref_snps.txt", sep = " ", quote = FALSE, col.names = FALSE)
+# ==============================================================================
+# 5. RESTRICT DATA TO OVERLAPPING SNPS
+# ==============================================================================
 
+cat("\n========== STEP 5: Restricting to overlapping SNPs ==========\n")
 
-## ============================================================================
-## STEP 3: RESTRICT DATA TO OVERLAPPING SNPs
-## ============================================================================
+# Subset reference panel
+system(paste("plink --bfile", REF_1KG, 
+             "--extract overlapping_snps.txt", 
+             "--make-bed --out temp_1kg_subset"))
 
-## Create 1KG reference with only overlapping SNPs
-system("plink --bfile /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/IMPUTE2_temp_1kg_Reference_All_Biallelic_SNPS --extract data_updated_temp_1kg_ref_snps.txt --make-bed --out temp_1kg_reference_for_data")
+# Subset data
+system(paste("plink --bfile temp_maf", 
+             "--extract overlapping_snps.txt", 
+             "--make-bed --out temp_data_matched"))
 
-## Trim sample data to match reference
-system("plink --bfile temp_data_37_maf --extract data_updated_temp_1kg_ref_snps.txt --make-bed --out temp_data_match_1kgRef")
+cat("Data and reference now have matching SNPs\n")
 
+# ==============================================================================
+# 6. STRAND ALIGNMENT USING RAYNER TOOL
+# ==============================================================================
 
-## ============================================================================
-## STEP 4: RAYNER TOOL (STRAND ALIGNMENT)
-## ============================================================================
+cat("\n========== STEP 6: Strand alignment (Rayner) ==========\n")
 
-## Generate frequency file (required by Rayner)
-system("plink --bfile temp_data_match_1kgRef --freq --out temp_data_match_1kgRef")
+# Generate frequency file (required by Rayner)
+system("plink --bfile temp_data_matched --freq --out temp_data_matched")
 
-## Run HRC-1000G-check-bim.pl
-## Options:
-##   -b: BIM file
-##   -f: Frequency file
-##   -r: Reference legend (1000GP_Phase3_combined.legend)
-##   -g: Generate PLINK script
-##   -p: Population (ALL for 1000G)
-system("perl /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC-1000G-check-bim-v4.2.11_Oct2019/HRC-1000G-check-bim.pl -b temp_data_match_1kgRef.bim -f temp_data_match_1kgRef.frq -r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/1000GP_Phase3_combined.legend -g -p ALL")
+# Run HRC check script
+system(paste(
+  "perl", HRC_SCRIPT,
+  "-b temp_data_matched.bim",
+  "-f temp_data_matched.frq", 
+  "-r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/1000GP_Phase3_combined.legend",
+  "-g -p ALL"
+))
 
-## Run the generated PLINK script
+# Run the generated PLINK script
 system("mv Run-plink.sh Run_plink_data.sh")
 system("chmod u+x Run_plink_data.sh")
 system("./Run_plink_data.sh")
 
-## Check results
-system("wc -l Exclude-temp_data_match_1kgRef-1000G.txt")  # Excluded variants
-system("wc -l temp_data_match_1kgRef-updated.bim")        # Retained variants
+# Check results
+cat("\nRayner results:\n")
+system("wc -l Exclude-temp_data_matched-1000G.txt")  # Excluded variants
+system("wc -l temp_data_matched-updated.bim")        # Retained variants
 
+# ==============================================================================
+# 7. MERGE WITH 1000 GENOMES FOR PCA
+# ==============================================================================
 
-## ============================================================================
-## STEP 5: PREPARE FILE FOR PCA
-## ============================================================================
+cat("\n========== STEP 7: Merging with 1000G for PCA ==========\n")
 
-## Create 1KG reference excluding problematic variants
-system("plink --bfile temp_1kg_reference_for_data --exclude Exclude-temp_data_match_1kgRef-1000G.txt --make-bed --out temp_data_match_1kgRef_raynor")
+# Remove problematic variants from reference
+system(paste("plink --bfile temp_1kg_subset", 
+             "--exclude Exclude-temp_data_matched-1000G.txt", 
+             "--make-bed --out temp_1kg_clean"))
 
-## Merge updated data with 1KG for PCA
-system("plink --bfile temp_data_match_1kgRef-updated --bmerge temp_data_match_1kgRef_raynor --threads 20 --make-bed --out temp_data_match_1kgRef-updated_1KG")
+# Merge data with reference
+system(paste("plink --bfile temp_data_matched-updated", 
+             "--bmerge temp_1kg_clean", 
+             "--threads 20", 
+             "--make-bed --out merged_1kg"))
 
+# If merge fails due to strand issues
+if(!file.exists("merged_1kg.bim")) {
+  cat("\nMerge failed, flipping mismatched SNPs...\n")
+  system("plink --bfile temp_data_matched-updated --flip merged_1kg-merge.missnp --make-bed --out temp_flipped")
+  system(paste("plink --bfile temp_flipped", 
+               "--bmerge temp_1kg_clean", 
+               "--make-bed --out merged_1kg"))
+}
 
-## ============================================================================
-## STEP 6: FLASHPCA
-## ============================================================================
+# ==============================================================================
+# 8. RUN PCA
+# ==============================================================================
 
-## Run PCA (20 dimensions)
-system("flashpca --bfile temp_data_match_1kgRef-updated_1KG --ndim 20 --suffix _data.txt --numthreads 20 > pca_data.log &")
+cat("\n========== STEP 8: Running PCA ==========\n")
 
-## Read PCA results
+# Run FlashPCA
+system("flashpca --bfile merged_1kg --ndim 20 --suffix _data.txt --numthreads 20 > pca.log 2>&1 &")
+
+# Wait for completion (check every 10 seconds)
+while(!file.exists("pcs_data.txt")) {
+  Sys.sleep(10)
+  cat(".")
+}
+cat("\nPCA complete!\n")
+
+# Read PCA results
 pcs <- fread("pcs_data.txt")
-dim(pcs)  # n_samples+1kg x 22
+cat("PCA dimensions:", dim(pcs), "\n")
 
-## Load 1000 Genomes super-population labels
-thousand_index <- fread("/projects/bga_lab/DATA_REPOSITORIES/1000Genome/1000Genome_labels.csv")
-sub_thous <- thousand_index[, c(1,3)]
-colnames(sub_thous)[1] <- "IID"
+# ==============================================================================
+# 9. VISUALIZE PCA WITH POPULATION LABELS
+# ==============================================================================
 
-## Merge population labels with PCA data
-PC_20_merged <- merge(pcs, sub_thous, by = "IID", all.x = TRUE)
+cat("\n========== STEP 9: Visualizing ancestry ==========\n")
 
-## Label your data (samples not in 1KG)
-PC_20_merged$GROUP[is.na(PC_20_merged$GROUP)] <- "DATA"
+# Load 1000 Genomes population labels
+thousand_labels <- fread("/projects/bga_lab/DATA_REPOSITORIES/1000Genome/1000Genome_labels.csv")
+colnames(thousand_labels)[1] <- "IID"
+colnames(thousand_labels)[3] <- "POPULATION"
 
-## Plot ancestry
-ggplot(PC_20_merged, aes(x = PC1, y = PC2, color = GROUP)) +
-  geom_point(size = 0.2) +
-  theme_classic()
-ggsave("data_pc2vpc1.png", width = 5, height = 5, units = "in")
+# Merge labels with PCA
+pcs_with_pop <- merge(pcs, thousand_labels[, .(IID, POPULATION)], by = "IID", all.x = TRUE)
 
-ggplot(PC_20_merged, aes(x = PC2, y = PC3, color = GROUP)) +
-  geom_point(size = 0.2) +
-  theme_classic()
-ggsave("data_pc2vpc3.png", width = 5, height = 5, units = "in")
+# Label our data (samples not in 1000G)
+pcs_with_pop[, GROUP := ifelse(is.na(POPULATION), "OUR_DATA", POPULATION)]
 
+# Create PCA plots
+p1 <- ggplot(pcs_with_pop, aes(x = PC1, y = PC2, color = GROUP)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  theme_classic() +
+  labs(title = "PCA: PC1 vs PC2", 
+       x = paste0("PC1 (", round(100 * var(pcs$PC1)/sum(apply(pcs[,2:21], 2, var)), 1), "%)"),
+       y = paste0("PC2 (", round(100 * var(pcs$PC2)/sum(apply(pcs[,2:21], 2, var)), 1), "%)")) +
+  theme(legend.position = "right")
 
-## ============================================================================
-## STEP 7: SELECT ANCESTRAL GROUPS
-## ============================================================================
+p2 <- ggplot(pcs_with_pop, aes(x = PC2, y = PC3, color = GROUP)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  theme_classic() +
+  labs(title = "PCA: PC2 vs PC3") +
+  theme(legend.position = "right")
 
-## Extract only your data samples
-data <- PC_20_merged[PC_20_merged$GROUP == "DATA", ]
+# Save plots
+ggsave("figures/pca_pc1vpc2.png", p1, width = 8, height = 6, dpi = 300)
+ggsave("figures/pca_pc2vpc3.png", p2, width = 8, height = 6, dpi = 300)
 
-## Load ancestry selection functions
+cat("PCA plots saved to 'figures/' directory\n")
+
+# ==============================================================================
+# 10. SELECT EUROPEAN ANCESTRY SAMPLES
+# ==============================================================================
+
+cat("\n========== STEP 10: Selecting European ancestry samples ==========\n")
+
+# Source ancestry selection functions
 source("select_ancestral.R")
 source("multiscale_ancestral.R")
 
-## Calculate population statistics and thresholds
-dat_select_ancestral <- select_ancestral(PC_20_merged)
+# Calculate ancestry thresholds
+ancestry_thresholds <- select_ancestral(pcs_with_pop)
 
-## View thresholds for each ancestry
-dat_select_ancestral$afr_thresholds
-dat_select_ancestral$eur_thresholds
-dat_select_ancestral$sas_thresholds
-dat_select_ancestral$eas_thresholds
-dat_select_ancestral$amr_thresholds
+# View thresholds
+cat("\nEuropean ancestry thresholds:\n")
+print(ancestry_thresholds$eur_thresholds)
 
-## Combine all thresholds
-all_thresholds <- cbind(
-  dat_select_ancestral$afr_thresholds,
-  dat_select_ancestral$eur_thresholds,
-  dat_select_ancestral$sas_thresholds,
-  dat_select_ancestral$eas_thresholds,
-  dat_select_ancestral$amr_thresholds
-)
-colnames(all_thresholds) <- c("afr", "eur", "sas", "eas", "amr")
-rownames(all_thresholds) <- c("upper_pc1", "lower_pc1", "upper_pc2", "lower_pc2", "upper_pc3", "lower_pc3")
+# Apply thresholds to select European samples
+data_only <- pcs_with_pop[GROUP == "OUR_DATA", ]
 
-## Apply thresholds to select European ancestry samples
-data_eur_1up <- data[data$PC1 <= all_thresholds[1, 2], ]
-data_eur_1lo <- data_eur_1up[data_eur_1up$PC1 >= all_thresholds[2, 2], ]
-data_eur_2up <- data_eur_1lo[data_eur_1lo$PC2 <= all_thresholds[3, 2], ]
-data_eur_2lo <- data_eur_2up[data_eur_2up$PC2 >= all_thresholds[4, 2], ]
-data_eur_3up <- data_eur_2lo[data_eur_2lo$PC3 <= all_thresholds[5, 2], ]
-data_eur_3lo <- data_eur_3up[data_eur_3up$PC3 >= all_thresholds[6, 2], ]
+# Filter using PC1, PC2, PC3 thresholds
+eur_selected <- data_only %>%
+  filter(PC1 <= ancestry_thresholds$eur_thresholds[1,1],   # Upper PC1
+         PC1 >= ancestry_thresholds$eur_thresholds[2,1],   # Lower PC1
+         PC2 <= ancestry_thresholds$eur_thresholds[3,1],   # Upper PC2
+         PC2 >= ancestry_thresholds$eur_thresholds[4,1],   # Lower PC2
+         PC3 <= ancestry_thresholds$eur_thresholds[5,1],   # Upper PC3
+         PC3 >= ancestry_thresholds$eur_thresholds[6,1])   # Lower PC3
 
-## Save keep lists
-data_eur_3lo_iids <- data_eur_3lo[, c(2, 1)]  # FID, IID format
-fwrite(data_eur_3lo_iids, "data_eur_3pcs_keeplist.txt", col.names = FALSE, sep = " ")
+cat("\nSelected", nrow(eur_selected), "European samples out of", nrow(data_only), "total\n")
 
-## Repeat for other ancestries (AFR, SAS, EAS, AMR) as needed
+# Save keep list
+eur_keep <- eur_selected[, .(FID = V1, IID)]
+fwrite(eur_keep, "output/eur_samples_keep.txt", sep = " ", col.names = FALSE)
 
+# ==============================================================================
+# 11. MULTIDIMENSIONAL OUTLIER DETECTION
+# ==============================================================================
 
-## ============================================================================
-## STEP 8: MULTIDIMENSIONAL OUTLIER DETECTION
-## ============================================================================
+cat("\n========== STEP 11: Removing outliers ==========\n")
 
-## Get PCA files for each ancestry
-eur_pcs <- data[data$IID %in% data_eur_3lo_iids$IID, ]
-fwrite(eur_pcs, "data_eur_pcs.txt")
+# Run multidimensional outlier detection
+mds_result <- multidimensional_scaling(eur_pcs = eur_selected)
 
-## Run multidimensional scaling outlier detection
-multidimensional_scaling <- multidimensional_scaling(afr_pcs, eur_pcs, sas_pcs, eas_pcs, amr_pcs)
+# Check outlier status
+cat("\nOutlier summary:\n")
+print(table(mds_result$m_eur_pcs$outlier))
 
-## Check outliers
-head(multidimensional_scaling$m_eur_pcs)
-table(multidimensional_scaling$m_eur_pcs$outlier)
+# Keep only non-outliers
+eur_clean <- mds_result$m_eur_pcs[mds_result$m_eur_pcs$outlier == 0, ]
 
-## Keep non-outliers
-eur_mds_keep <- multidimensional_scaling$m_eur_pcs[
-  multidimensional_scaling$m_eur_pcs$outlier == 0,
-]
-fwrite(eur_mds_keep[, c(2, 1)], "data_eur_3pcs_keeplist_mds.txt", col.names = FALSE, sep = " ")
+# Save final keep list
+eur_final_keep <- eur_clean[, .(FID = V1, IID)]
+fwrite(eur_final_keep, "output/eur_final_keep.txt", sep = " ", col.names = FALSE)
 
+cat("Final European samples after outlier removal:", nrow(eur_clean), "\n")
 
-## ============================================================================
-## STEP 9: EXTRACT SUPER-POPULATIONS FROM SAMPLE DATA
-## ============================================================================
+# ==============================================================================
+# 12. EXTRACT EUROPEAN SUBSET
+# ==============================================================================
 
-## Create PLINK subsets for each ancestry
-system("plink --bfile temp_data_37 --keep data_eur_3pcs_keeplist_mds.txt --make-bed --out data_37_eur")
+cat("\n========== STEP 12: Extracting European subset ==========\n")
 
+system(paste("plink --bfile", OUTPUT_PREFIX, 
+             "--keep output/eur_final_keep.txt", 
+             "--make-bed --out data_37_eur"))
 
-## ============================================================================
-## STEP 10: POPULATION-SPECIFIC RAYNER TOOL
-## ============================================================================
+# ==============================================================================
+# 13. POPULATION-SPECIFIC STRAND ALIGNMENT (EUROPEAN)
+# ==============================================================================
 
-## For EUROPEAN (EUR) - Use HRC reference
+cat("\n========== STEP 13: European-specific alignment ==========\n")
+
+# Generate frequency file
 system("plink --bfile data_37_eur --freq --out data_37_eur")
-system("perl /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC-1000G-check-bim-v4.3.0/HRC-1000G-check-bim.pl -b data_37_eur.bim -f data_37_eur.frq -r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC_FILES/HRC.r1-1.GRCh37.wgs.mac5.sites.tab -h -t 0.1")
-system("mv Run-plink.sh Run_plink_data_37_eur.sh")
-system("chmod u+x Run_plink_data_37_eur.sh")
-system("./Run_plink_data_37_eur.sh")
 
-## For AFRICAN (AFR) - Use CAAPA reference (build 37)
-system("plink --bfile data_37_afr --freq --out data_37_afr")
-system("perl /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC-1000G-check-bim-v4.3.0/HRC-1000G-check-bim.pl -b data_37_afr.bim -f data_37_afr.frq -r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/CAAPA_FILES/all.caapa.sorted.txt -h -t .1")
+# Run Rayner with HRC reference
+system(paste(
+  "perl", HRC_SCRIPT,
+  "-b data_37_eur.bim",
+  "-f data_37_eur.frq",
+  "-r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC_FILES/HRC.r1-1.GRCh37.wgs.mac5.sites.tab",
+  "-h -t 0.1"
+))
 
-## For AFRICAN build 38 - Use TOPMED reference
-system("sh /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/update_build.sh data_37_afr /scratch/silo1/BGA_LAB/dbGaP/HumanOmni1-Quad_v1-0_H-b38.Source.strand data_38_afr")
-system("plink --bfile data_38_afr --freq --out data_38_afr")
-system("perl /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC-1000G-check-bim-v4.3.0/HRC-1000G-check-bim.pl -b data_38_afr.bim -f data_38_afr.frq -h -r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/TOPMED_REF/PASS.Variantsbravo-dbsnp-all.tab -t .1")
+# Apply corrections
+system("mv Run-plink.sh Run_plink_eur.sh")
+system("chmod u+x Run_plink_eur.sh")
+system("./Run_plink_eur.sh")
 
-## For SOUTH ASIAN (SAS) and EAST ASIAN (EAS) - Use Asian 100K reference
-system("plink --bfile data_37_sas --freq --out data_37_sas")
-system("perl /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC-1000G-check-bim-v4.3.0/HRC-1000G-check-bim.pl -b data_37_sas.bim -f data_37_sas.frq -r /projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/asian_100K/ASIA.Genome.Reference.legend -g -p ALL -t 0.1")
+# ==============================================================================
+# 14. PER-CHROMOSOME QC
+# ==============================================================================
 
+cat("\n========== STEP 14: Per-chromosome QC ==========\n")
 
-## ============================================================================
-## STEP 11: QC BY CHROMOSOME
-## ============================================================================
-
-## Split by chromosome (Rayner outputs per-chromosome files)
-## For each chromosome, apply:
-##   --geno 0.05: Remove SNPs missing in >5%
-##   --maf 0.01:  Keep MAF > 1% (post-imputation threshold)
-##   --mind 0.1:  Remove samples missing >10%
-
-chrm <- 1:22
-
-## Example for EUR
-for(i in chrm) {
-  cmd_geno <- paste0("plink --bfile data_37_eur-updated-chr", i, 
-                     " --geno 0.05 --threads 20 --make-bed --out data_37_eur-updated-chr", i, "_geno")
-  system(cmd_geno)
+# Process chromosomes 1-22
+for(chr in 1:22) {
+  cat("Processing chromosome", chr, "...\n")
   
-  cmd_maf <- paste0("plink --bfile data_37_eur-updated-chr", i, 
-                    "_geno --maf 0.01 --threads 20 --make-bed --out data_37_eur-updated-chr", i, "_maf")
-  system(cmd_maf)
+  # Apply QC filters per chromosome
+  system(paste("plink --bfile data_37_eur-updated-chr", chr, 
+               "--geno", GENO_THRESH, 
+               "--threads 20", 
+               "--make-bed --out data_37_eur-chr", chr, "_geno"))
   
-  cmd_mind <- paste0("plink --bfile data_37_eur-updated-chr", i, 
-                     "_maf --mind 0.1 --threads 20 --make-bed --out data_37_eur-updated-chr", i, "_mind")
-  system(cmd_mind)
+  system(paste("plink --bfile data_37_eur-chr", chr, "_geno",
+               "--maf", MAF_POST, 
+               "--threads 20", 
+               "--make-bed --out data_37_eur-chr", chr, "_maf"))
+  
+  system(paste("plink --bfile data_37_eur-chr", chr, "_maf",
+               "--mind", MIND_THRESH, 
+               "--threads 20", 
+               "--make-bed --out data_37_eur-chr", chr, "_final"))
 }
 
+cat("Per-chromosome QC complete\n")
 
-## ============================================================================
-## STEP 12: PREPARE VCF FOR IMPUTATION SERVER
-## ============================================================================
+# ==============================================================================
+# 15. CONVERT TO VCF FOR IMPUTATION SERVER
+# ==============================================================================
 
-## Convert PLINK to VCF
-for(i in chrm) {
-  cmd <- paste0("plink --bfile data_37_eur-updated-chr", i, 
-                "_mind --recode vcf --out data_37_eur-updated-chr", i)
-  system(cmd)
+cat("\n========== STEP 15: Creating VCF files ==========\n")
+
+# Convert each chromosome to VCF
+for(chr in 1:22) {
+  cat("Converting chromosome", chr, "to VCF...\n")
+  
+  # Convert to VCF
+  system(paste("plink --bfile data_37_eur-chr", chr, "_final",
+               "--recode vcf --out data_37_eur-chr", chr))
+  
+  # Sort and compress
+  system(paste("vcf-sort data_37_eur-chr", chr, ".vcf | bgzip -c > data_37_eur-chr", chr, ".vcf.gz"))
+  
+  # Index
+  system(paste("tabix -p vcf data_37_eur-chr", chr, ".vcf.gz"))
 }
 
-## Sort and compress VCF
-for(i in chrm) {
-  cmd <- paste0("vcf-sort data_37_eur-updated-chr", i, 
-                ".vcf | bgzip -c > data_37_eur-updated-chr", i, ".vcf.gz")
-  system(cmd)
-}
-
-## ============================================================================
-## READY FOR IMPUTATION SERVER
-## ============================================================================
-
-## Upload VCFs to: https://imputationserver.sph.umich.edu
-## Select appropriate reference panel:
-##   - EUR: HRC.r1-1.2016 (build 37)
-##   - AFR: CAAPA (build 37) or TOPMED (build 38)
-##   - SAS/EAS: Asia-100K
+cat("\n========================================\n")
+cat("✓ PIPELINE COMPLETE!\n")
+cat("========================================\n")
+cat("\nOutput files:\n")
+cat("  - European subset: data_37_eur\n")
+cat("  - VCF files: data_37_eur-chr*.vcf.gz\n")
+cat("  - PCA plots: figures/pca_*.png\n")
+cat("  - Sample lists: output/eur_*_keep.txt\n")
+cat("\nReady for upload to imputation server:\n")
+cat("  https://imputationserver.sph.umich.edu\n")
+cat("  Recommended reference panel: HRC.r1-1.2016 (build 37)\n")
+cat("\n========================================\n")
