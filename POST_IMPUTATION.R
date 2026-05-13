@@ -1,195 +1,448 @@
-#############################################
-##### Post-Imputation Processing and QC #####  
-#############################################
+################################################################################
+#                                                                              #
+#                   POST-IMPUTATION PROCESSING AND QC PIPELINE                 #
+#                                                                              #
+################################################################################
 
-## ============================================================================
-## METADATA (EDIT FOR YOUR DATASET)
-## ============================================================================
+# ==============================================================================
+# METADATA (EDIT FOR YOUR DATASET)
+# ==============================================================================
 
-## analyst:
-## date:
-## Name of dataset:
-## Location of imputed data:
-## Ancestry you're working with:
-## change: "data" to your dataset and "ancestry" to AFR or EUR (or admixed)
+# Analyst:              [Your Name]
+# Date:                 [YYYY-MM-DD]
+# Dataset name:         [Dataset Name]
+# Location of imputed data: [Path to Michigan Server downloads]
+# Ancestry:             AFR / EUR / SAS / EAS / AMR
+# Imputation password:  [YOUR PASSWORD]
 
-## ============================================================================
-## LOAD LIBRARIES
-## ============================================================================
+# ==============================================================================
+# 0. SETUP - Load libraries & create directories
+# ==============================================================================
 
 library(data.table)
 library(dplyr)
 library(tidyr)
 
-## ============================================================================
-## STEP 0: DOWNLOAD DATA FROM MICHIGAN SERVER
-## ============================================================================
-
-## Imputation password: [YOUR PASSWORD]
-
-## ============================================================================
-## STEP 1: UNZIP EACH CHROMOSOME FOLDER
-## ============================================================================
-
-chrm <- 1:22
-x <- NULL
-for(i in 1:22) {
-  x <- rbind(x, paste("7z x chr_", chrm[i], ".zip -p'password'", sep = ""))
+# Create output directories
+dirs <- c("logs", "output", "temp", "summary_tables")
+for(d in dirs) {
+  if(!dir.exists(d)) dir.create(d)
 }
-write.table(x, file = "unzip_data.sh", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# Set paths (MODIFY THESE)
+IMPUTATION_PASSWORD <- "your_password_here"
+ANCESTRY <- "eur"  # Change to afr, sas, eas, amr as needed
+DATA_NAME <- "your_dataset"
+
+# QC thresholds
+RSQ_THRESHOLDS <- c(0.3, 0.5, 0.7, 0.9)
+HRC_REF_FILE <- "/projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC_FILES/HRC_reference_biallelic_snps_bim_format_CHRPOS.txt"
+
+# ==============================================================================
+# 1. UNZIP ALL FILES FROM MICHIGAN SERVER
+# ==============================================================================
+
+cat("\n========== STEP 1: Unzipping chromosome files ==========\n")
+
+# Create unzip script for chromosome zip files
+chrm <- 1:22
+unzip_commands <- paste0("7z x chr_", chrm, ".zip -p'", IMPUTATION_PASSWORD, "'")
+write.table(unzip_commands, file = "unzip_data.sh", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
 system("dos2unix unzip_data.sh")
 system("chmod +x unzip_data.sh")
-system("nohup ./unzip_data.sh > unzip_data.log &")
+system("nohup ./unzip_data.sh > logs/unzip_data.log 2>&1 &")
+cat("Unzipping chromosomes in background...\n")
 
-## ============================================================================
-## STEP 2: UNZIP EACH .INFO FILE
-## ============================================================================
+# ==============================================================================
+# 2. UNZIP INFO FILES
+# ==============================================================================
 
-x2 <- NULL
-for(i in 1:22) {
-  x2 <- rbind(x2, paste("gunzip chr", chrm[i], ".info.gz", sep = ""))
+cat("\n========== STEP 2: Unzipping .info files ==========\n)
+
+# Create unzip script for info files
+unzip_info <- paste0("gunzip chr", chrm, ".info.gz")
+write.table(unzip_info, file = "unzip_info.sh", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+system("dos2unix unzip_info.sh")
+system("chmod +x unzip_info.sh")
+system("nohup ./unzip_info.sh > logs/unzip_info.log 2>&1 &")
+cat("Unzipping info files in background...\n")
+
+# Wait for files to unzip (check every 30 seconds)
+cat("Waiting for files to unzip...\n")
+all_unzipped <- FALSE
+while(!all_unzipped) {
+  Sys.sleep(30)
+  info_files_exist <- all(file.exists(paste0("chr", chrm, ".info")))
+  if(info_files_exist) {
+    all_unzipped <- TRUE
+    cat("All files unzipped!\n")
+  }
 }
-write.table(x2, file = "unzip_info_data.sh", row.names = FALSE, col.names = FALSE, quote = FALSE)
-system("dos2unix unzip_info_data.sh")
-system("chmod +x unzip_info_data.sh")
-system("nohup ./unzip_info_data.sh > unzip_info_data.log &")
 
-## ============================================================================
-## STEP 3: PREPARE IMPUTED FILES FOR MERGING
-## ============================================================================
+# ==============================================================================
+# 3. COMBINE INFO FILES AND CALCULATE IMPUTATION STATISTICS
+# ==============================================================================
 
-## Read in all chromosome info files
-chr1 <- fread("chr1.info", header = TRUE, sep = "\t", na.strings = "-")
-chr2 <- fread("chr2.info", header = TRUE, sep = "\t", na.strings = "-")
-# ... repeat for chr3-22
+cat("\n========== STEP 3: Processing imputation quality scores ==========\n")
 
-## Bind all together
-allchrm <- rbind(chr1, chr2, chr3, chr4, chr5, chr6, chr7, chr8, chr9, chr10,
-                 chr11, chr12, chr13, chr14, chr15, chr16, chr17, chr18, chr19,
-                 chr20, chr21, chr22)
+# Read all chromosome info files
+cat("Reading info files...\n")
+all_chromosomes <- list()
 
-nrow(allchrm)  # Total number imputed
-table(allchrm$Genotyped)  # Genotyped vs Imputed count
-mean(allchrm$Rsq)  # Mean imputation quality
-fivenum(allchrm$Rsq)  # Five-number summary of Rsq
+for(i in 1:22) {
+  cat("  Reading chr", i, "...\n", sep = "")
+  all_chromosomes[[i]] <- fread(paste0("chr", i, ".info"), 
+                                header = TRUE, sep = "\t", na.strings = "-")
+}
 
-## Create filters for different Rsq thresholds
-allchrm_r2.3 <- allchrm[allchrm$Rsq > 0.3, ]
-allchrm_r2.5 <- allchrm[allchrm$Rsq > 0.5, ]
-allchrm_r2.7 <- allchrm[allchrm$Rsq > 0.7, ]
-allchrm_r2.9 <- allchrm[allchrm$Rsq > 0.9, ]
+# Combine into single data table
+all_imputed <- rbindlist(all_chromosomes)
+cat("\nTotal variants imputed:", nrow(all_imputed), "\n")
 
-## Save keep lists
-fwrite(allchrm_r2.3, "allchrm_keep_rsq3_data.csv", row.names = FALSE, col.names = FALSE, quote = FALSE)
-fwrite(allchrm_r2.5, "allchrm_keep_rsq5_data.csv", row.names = FALSE, col.names = FALSE, quote = FALSE)
-fwrite(allchrm_r2.7, "allchrm_keep_rsq7_data.csv", row.names = FALSE, col.names = FALSE, quote = FALSE)
-fwrite(allchrm_r2.9, "allchrm_keep_rsq9_data.csv", row.names = FALSE, col.names = FALSE, quote = FALSE)
+# Summary of genotyped vs imputed
+geno_summary <- table(all_imputed$Genotyped)
+cat("\nGenotyped vs Imputed variants:\n")
+print(geno_summary)
 
-## Create chr:pos identifiers for matching with HRC
-library(tidyr)
-allchrm_r2.3_chrmpos <- separate(allchrm_r2.3, SNP, c("chr", "pos"), sep = ":", extra = 'drop')
-chrmpos_r2.3 <- paste(allchrm_r2.3_chrmpos$chr, allchrm_r2.3_chrmpos$pos, sep = ":")
+# Imputation quality statistics
+cat("\nImputation quality (Rsq) statistics:\n")
+cat("  Mean Rsq:", mean(all_imputed$Rsq, na.rm = TRUE), "\n")
+cat("  Median Rsq:", median(all_imputed$Rsq, na.rm = TRUE), "\n")
+cat("  Min Rsq:", min(all_imputed$Rsq, na.rm = TRUE), "\n")
+cat("  Max Rsq:", max(all_imputed$Rsq, na.rm = TRUE), "\n")
+cat("  Five-number summary:\n")
+print(fivenum(all_imputed$Rsq))
 
-## Create update-name file for BIM file
-## Converts from "chr:pos:A1:A2" to "chr:pos" format
-allchrm$chrpos <- substr(allchrm$SNP, 1, nchar(allchrm$SNP) - 4)  # Remove last 4 chars (:A1:A2)
-update_names <- allchrm[, c("SNP", "chrpos")]
-fwrite(update_names, "update_names.txt", sep = " ", col.names = FALSE, row.names = FALSE, quote = FALSE)
+# Create SNP identifier (chr:pos format)
+all_imputed[, chrpos := substr(SNP, 1, nchar(SNP) - 4)]  # Remove :A1:A2 suffix
 
-## Filter to HRC biallelic variants
-list_HRC <- fread("/projects/bga_lab/DATA_REPOSITORIES/IMP_PIPELINE_FILES/HRC_FILES/HRC_reference_biallelic_snps_bim_format_CHRPOS.txt", header = FALSE, sep = " ")
+# Filter by different Rsq thresholds
+cat("\nCreating Rsq-filtered datasets...\n")
+rsq_filters <- list()
 
-keepers_rsq3 <- list_HRC[list_HRC$V2 %in% chrmpos_r2.3, ]
-fwrite(keepers_rsq3[, 2], "keeper_markers_rsq3_data.txt", row.names = FALSE, col.names = FALSE, quote = FALSE, sep = " ")
+for(r in RSQ_THRESHOLDS) {
+  threshold_name <- paste0("rsq", r * 10)
+  rsq_filters[[threshold_name]] <- all_imputed[Rsq > r, ]
+  cat("  Rsq >", r, ":", nrow(rsq_filters[[threshold_name]]), "variants\n")
+  
+  # Save keep lists
+  fwrite(rsq_filters[[threshold_name]][, .(SNP)], 
+         file = paste0("output/keep_", threshold_name, "_", DATA_NAME, ".txt"),
+         col.names = FALSE, quote = FALSE)
+}
 
-keepers_rsq7 <- list_HRC[list_HRC$V2 %in% chrmpos_r2.7, ]
-fwrite(keepers_rsq7[, 2], "keeper_markers_rsq7_data.txt", row.names = FALSE, col.names = FALSE, quote = FALSE, sep = " ")
+# ==============================================================================
+# 4. FILTER TO HRC BIALLELIC VARIANTS
+# ==============================================================================
 
-## Create summary table
-all_imputed <- as.data.frame(table(allchrm$Genotyped))
-names(all_imputed) <- c("QC", "SNPs")
+cat("\n========== STEP 4: Filtering to HRC biallelic variants ==========\n")
 
-rsq <- c(length(chrmpos_r2.3), length(chrmpos_r2.5), length(chrmpos_r2.7), length(chrmpos_r2.9))
-rsq_label <- c("Imputation Quality: R2 > .3", "Imputation Quality: R2 > .5", 
-               "Imputation Quality: R2 > .7", "Imputation Quality: R2 > .9")
-rsq2_table <- as.data.frame(cbind(rsq_label, rsq))
-names(rsq2_table) <- c("QC", "SNPs")
+# Load HRC reference
+cat("Loading HRC reference...\n")
+hrc_ref <- fread(HRC_REF_FILE, header = FALSE, sep = " ")
+hrc_snps <- hrc_ref$V2
+cat("HRC reference variants:", length(hrc_snps), "\n")
 
-biallelic <- c(nrow(keepers_rsq3), nrow(keepers_rsq5), nrow(keepers_rsq7), nrow(keepers_rsq9))
-biallelic_label <- c("Biallelic: R2 > .3", "Biallelic: R2 > .5", 
-                     "Biallelic: R2 > .7", "Biallelic: R2 > .9")
-biallelic_table <- as.data.frame(cbind(biallelic_label, biallelic))
-names(biallelic_table) <- c("QC", "SNPs")
+# Filter each Rsq threshold to HRC variants
+biallelic_counts <- c()
 
-imputed_table <- rbind(all_imputed, rsq2_table, biallelic_table)
-write.csv(imputed_table, "data_imputed_ancestry_summary_table.csv", row.names = FALSE, quote = TRUE)
+for(r in RSQ_THRESHOLDS) {
+  threshold_name <- paste0("rsq", r * 10)
+  
+  # Get chr:pos identifiers for this threshold
+  snps_to_keep <- rsq_filters[[threshold_name]]$chrpos
+  
+  # Find which ones are in HRC
+  keep_in_hrc <- hrc_ref[hrc_ref$V2 %in% snps_to_keep, ]
+  
+  cat("  Rsq >", r, ": Keeping", nrow(keep_in_hrc), "biallelic HRC variants\n")
+  
+  # Save final keep list
+  fwrite(keep_in_hrc[, .(V2)], 
+         file = paste0("output/keepers_", threshold_name, "_", DATA_NAME, ".txt"),
+         col.names = FALSE, quote = FALSE)
+  
+  biallelic_counts <- c(biallelic_counts, nrow(keep_in_hrc))
+}
 
-## ============================================================================
-## STEP 4: MERGE IMPUTED FILES
-## ============================================================================
+# ==============================================================================
+# 5. CREATE SUMMARY TABLE
+# ==============================================================================
 
-## Convert VCF to PLINK
-chrm <- 1:22
-for(i in chrm) {
-  cmd <- paste0("plink --vcf chr", i, ".dose.vcf.gz --const-fid --make-bed --out data_ancestry_imputed_chr", i)
+cat("\n========== STEP 5: Creating summary table ==========\n")
+
+# Build comprehensive summary table
+summary_table <- data.frame(
+  QC_Step = c(
+    "Total imputed variants",
+    "Genotyped variants",
+    "Imputed variants",
+    paste0("Rsq > ", RSQ_THRESHOLDS[1]),
+    paste0("Rsq > ", RSQ_THRESHOLDS[2]),
+    paste0("Rsq > ", RSQ_THRESHOLDS[3]),
+    paste0("Rsq > ", RSQ_THRESHOLDS[4]),
+    paste0("Biallelic HRC (Rsq > ", RSQ_THRESHOLDS[1], ")"),
+    paste0("Biallelic HRC (Rsq > ", RSQ_THRESHOLDS[2], ")"),
+    paste0("Biallelic HRC (Rsq > ", RSQ_THRESHOLDS[3], ")"),
+    paste0("Biallelic HRC (Rsq > ", RSQ_THRESHOLDS[4], ")")
+  ),
+  Variants = c(
+    nrow(all_imputed),
+    geno_summary["1"],
+    geno_summary["0"],
+    nrow(rsq_filters$rsq3),
+    nrow(rsq_filters$rsq5),
+    nrow(rsq_filters$rsq7),
+    nrow(rsq_filters$rsq9),
+    biallelic_counts[1],
+    biallelic_counts[2],
+    biallelic_counts[3],
+    biallelic_counts[4]
+  )
+)
+
+# Save summary table
+write.csv(summary_table, 
+          file = paste0("summary_tables/", DATA_NAME, "_", ANCESTRY, "_imputation_summary.csv"),
+          row.names = FALSE)
+
+cat("\nSummary table saved!\n")
+print(summary_table)
+
+# ==============================================================================
+# 6. CONVERT VCF TO PLINK FORMAT
+# ==============================================================================
+
+cat("\n========== STEP 6: Converting VCF to PLINK ==========\n")
+
+# Convert each chromosome from VCF to PLINK
+for(i in 1:22) {
+  cat("Converting chromosome", i, "...\n")
+  
+  cmd <- paste0("plink --vcf chr", i, ".dose.vcf.gz ",
+                "--const-fid ",
+                "--make-bed ",
+                "--out temp/", DATA_NAME, "_", ANCESTRY, "_imputed_chr", i)
   system(cmd)
 }
 
-## Create merge list
-for(i in chrm) {
-  write(paste0("data_ancestry_imputed_chr", i), file = "chrmerge_list.txt", append = TRUE)
+cat("VCF to PLINK conversion complete\n")
+
+# ==============================================================================
+# 7. MERGE ALL CHROMOSOMES
+# ==============================================================================
+
+cat("\n========== STEP 7: Merging chromosomes ==========\n")
+
+# Create merge list
+merge_list <- paste0("temp/", DATA_NAME, "_", ANCESTRY, "_imputed_chr", 1:22)
+writeLines(merge_list, "temp/chrmerge_list.txt")
+
+# Merge all chromosomes
+cat("Merging all chromosomes...\n")
+system(paste("plink --bfile temp/", DATA_NAME, "_", ANCESTRY, "_imputed_chr1 ",
+             "--merge-list temp/chrmerge_list.txt ",
+             "--make-bed ",
+             "--out output/", DATA_NAME, "_", ANCESTRY, "_imputed_allchr"))
+
+cat("Chromosome merge complete\n")
+
+# ==============================================================================
+# 8. UPDATE VARIANT NAMES TO CHR:POS FORMAT
+# ==============================================================================
+
+cat("\n========== STEP 8: Updating variant names ==========\n")
+
+# Create update name file (original SNP -> chr:pos)
+update_names <- all_imputed[, .(SNP, chrpos)]
+fwrite(update_names, "temp/update_names.txt", 
+       sep = " ", col.names = FALSE, row.names = FALSE, quote = FALSE)
+
+# Apply name update
+system(paste("plink --bfile output/", DATA_NAME, "_", ANCESTRY, "_imputed_allchr ",
+             "--update-name temp/update_names.txt ",
+             "--make-bed ",
+             "--out output/", DATA_NAME, "_", ANCESTRY, "_chrpos"))
+
+cat("Variant names updated to chr:pos format\n")
+
+# ==============================================================================
+# 9. FIX SAMPLE IDs (IMPUTATION SERVER ADDS EXTRA TEXT)
+# ==============================================================================
+
+cat("\n========== STEP 9: Fixing sample IDs ==========\n")
+
+# Read original FAM file (your pre-imputation samples)
+original_fam <- fread("filepath-to-original-data/data.fam", header = FALSE)
+
+# Read imputed FAM file
+imp_fam <- fread(paste0("output/", DATA_NAME, "_", ANCESTRY, "_chrpos.fam"), 
+                 header = FALSE)
+
+# Extract original IDs (imputation server adds _IID suffix)
+imp_fam[, IID_clean := gsub(".*_", "", V2)]  # Keep part after underscore
+imp_fam[, FID := IID_clean]                  # Use same as IID
+
+# Create new FAM file with correct IDs
+new_fam <- imp_fam[, .(FID, IID_clean, V3, V4, V5, V6)]
+colnames(new_fam) <- c("FID", "IID", "Pat", "Mat", "Sex", "Pheno")
+
+# Save updated FAM file
+fwrite(new_fam, "temp/corrected_ids.fam", 
+       sep = " ", col.names = FALSE, quote = FALSE)
+
+# Apply corrected IDs to PLINK files
+system(paste("plink --bfile output/", DATA_NAME, "_", ANCESTRY, "_chrpos ",
+             "--fam temp/corrected_ids.fam ",
+             "--make-bed ",
+             "--out output/", DATA_NAME, "_", ANCESTRY, "_ids_fixed"))
+
+cat("Sample IDs corrected\n")
+
+# ==============================================================================
+# 10. APPLY RSQ AND HRC FILTERS
+# ==============================================================================
+
+cat("\n========== STEP 10: Applying quality filters ==========\n)
+
+# For Rsq > 0.3 (recommended minimum)
+cat("\nCreating Rsq > 0.3 filtered dataset...\n")
+system(paste("plink --bfile output/", DATA_NAME, "_", ANCESTRY, "_ids_fixed ",
+             "--extract output/keepers_rsq3_", DATA_NAME, ".txt ",
+             "--make-bed ",
+             "--out output/", DATA_NAME, "_", ANCESTRY, "_rsq3"))
+
+# For Rsq > 0.7 (higher quality, recommended for most analyses)
+cat("Creating Rsq > 0.7 filtered dataset...\n")
+system(paste("plink --bfile output/", DATA_NAME, "_", ANCESTRY, "_ids_fixed ",
+             "--extract output/keepers_rsq7_", DATA_NAME, ".txt ",
+             "--make-bed ",
+             "--out output/", DATA_NAME, "_", ANCESTRY, "_rsq7"))
+
+# ==============================================================================
+# 11. REMOVE DUPLICATE VARIANTS (IF ANY)
+# ==============================================================================
+
+cat("\n========== STEP 11: Removing duplicate variants ==========\n")
+
+# Check for duplicates in Rsq3 dataset
+bim_rsq3 <- fread(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3.bim"))
+duplicate_check <- table(duplicated(bim_rsq3$V2))
+
+cat("Duplicates in Rsq3 dataset:\n")
+print(duplicate_check)
+
+if(any(duplicated(bim_rsq3$V2))) {
+  # Keep only unique variants
+  unique_snps <- bim_rsq3[!duplicated(V2), .(V2)]
+  fwrite(unique_snps, "temp/unique_snps.txt", 
+         col.names = FALSE, quote = FALSE)
+  
+  # Remove duplicates
+  system(paste("plink --bfile output/", DATA_NAME, "_", ANCESTRY, "_rsq3 ",
+               "--extract temp/unique_snps.txt ",
+               "--make-bed ",
+               "--out output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup"))
+  
+  cat("Duplicates removed from Rsq3 dataset\n")
+} else {
+  cat("No duplicates found\n")
+  # Copy file if no duplicates
+  file.copy(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3.bim"),
+            paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup.bim"))
+  file.copy(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3.bed"),
+            paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup.bed"))
+  file.copy(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3.fam"),
+            paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup.fam"))
 }
 
-## Merge all chromosomes
-system("nohup plink --bfile data_ancestry_imputed_chr1 --merge-list chrmerge_list.txt --make-bed --out data_ancestry_imputed_allchrm --threads 20 &")
+# Repeat for Rsq7 dataset
+bim_rsq7 <- fread(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq7.bim"))
+if(any(duplicated(bim_rsq7$V2))) {
+  unique_snps_rsq7 <- bim_rsq7[!duplicated(V2), .(V2)]
+  fwrite(unique_snps_rsq7, "temp/unique_snps_rsq7.txt", 
+         col.names = FALSE, quote = FALSE)
+  
+  system(paste("plink --bfile output/", DATA_NAME, "_", ANCESTRY, "_rsq7 ",
+               "--extract temp/unique_snps_rsq7.txt ",
+               "--make-bed ",
+               "--out output/", DATA_NAME, "_", ANCESTRY, "_rsq7_nodup"))
+}
 
-## Update variant names to match HRC format
-system("plink --bfile data_ancestry_imputed_allchrm --update-name update_names.txt --make-bed --out allchrm_data_ancestry_chrpos")
+# ==============================================================================
+# 12. FINAL QUALITY CONTROL CHECKS
+# ==============================================================================
 
-## ============================================================================
-## STEP 5: UPDATE PARTICIPANT IDs TO MATCH ORIGINAL IDs
-## ============================================================================
+cat("\n========== STEP 12: Final QC checks ==========\n")
 
-## Read original FAM file
-original_fam <- fread("filepath-to-original-data/data.fam")
+# Function to get file info
+get_file_info <- function(prefix) {
+  bim_file <- paste0(prefix, ".bim")
+  fam_file <- paste0(prefix, ".fam")
+  
+  if(file.exists(bim_file) & file.exists(fam_file)) {
+    variants <- system(paste("wc -l", bim_file), intern = TRUE)
+    samples <- system(paste("wc -l", fam_file), intern = TRUE)
+    return(list(variants = as.numeric(strsplit(variants, " ")[[1]][1]),
+                samples = as.numeric(strsplit(samples, " ")[[1]][1])))
+  } else {
+    return(list(variants = NA, samples = NA))
+  }
+}
 
-## Read imputed FAM file
-imp_fam <- fread("allchrm_data_ancestry_chrpos.fam", header = FALSE, sep = " ")
+# Check final datasets
+cat("\nFinal dataset statistics:\n")
+cat("  Rsq > 0.3 (with duplicates):\n")
+rsq3_info <- get_file_info(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3"))
+cat("    Variants:", rsq3_info$variants, "\n")
+cat("    Samples:", rsq3_info$samples, "\n")
 
-## Split combined IDs (format: FID_IID)
-imp_fam$newV2 <- gsub("_", ",", imp_fam$V2)
-imp_fam_new <- imp_fam %>% separate(col = newV2, into = c("FID", "IID"), sep = ",")
+cat("\n  Rsq > 0.3 (no duplicates):\n")
+rsq3_nodup_info <- get_file_info(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup"))
+cat("    Variants:", rsq3_nodup_info$variants, "\n")
+cat("    Samples:", rsq3_nodup_info$samples, "\n")
 
-## Write new FAM file
-write.table(imp_fam_new[, c(7:8, 3:6)], "imp_fam_IDadjust.fam", row.names = FALSE, col.names = FALSE, quote = FALSE)
+cat("\n  Rsq > 0.7 (no duplicates):\n")
+rsq7_nodup_info <- get_file_info(paste0("output/", DATA_NAME, "_", ANCESTRY, "_rsq7_nodup"))
+cat("    Variants:", rsq7_nodup_info$variants, "\n")
+cat("    Samples:", rsq7_nodup_info$samples, "\n")
 
-## Update IDs in PLINK file
-system("plink --bfile allchrm_data_ancestry_chrpos --fam imp_fam_IDadjust.fam --make-bed --out allchrm_data_ancestry_chrpos_ids")
+# ==============================================================================
+# 13. CREATE FINAL RENAMED OUTPUT
+# ==============================================================================
 
-## ============================================================================
-## STEP 6: SCREEN MARKERS
-## ============================================================================
+cat("\n========== STEP 13: Creating final output files ==========\n)
 
-## Keep well-imputed biallelic markers
-system("plink --bfile allchrm_data_ancestry_chrpos_ids --extract keeper_markers_rsq3_data.txt --make-bed --out data_ancestry_imputed_rsq3")
-system("plink --bfile allchrm_data_ancestry_chrpos_ids --extract keeper_markers_rsq7_data.txt --make-bed --out data_ancestry_imputed_rsq7")
+# For Rsq > 0.3 (more variants, lower quality)
+final_name_rsq3 <- paste0(DATA_NAME, "_", ANCESTRY, "_imputed_rsq3")
+system(paste("cp output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup.bed ", final_name_rsq3, ".bed", sep = ""))
+system(paste("cp output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup.bim ", final_name_rsq3, ".bim", sep = ""))
+system(paste("cp output/", DATA_NAME, "_", ANCESTRY, "_rsq3_nodup.fam ", final_name_rsq3, ".fam", sep = ""))
 
-## Check for duplicate markers
-bim <- fread("data_ancestry_imputed_rsq3.bim")
-table(duplicated(bim$V2))
+# For Rsq > 0.7 (fewer variants, higher quality)
+final_name_rsq7 <- paste0(DATA_NAME, "_", ANCESTRY, "_imputed_rsq7")
+system(paste("cp output/", DATA_NAME, "_", ANCESTRY, "_rsq7_nodup.bed ", final_name_rsq7, ".bed", sep = ""))
+system(paste("cp output/", DATA_NAME, "_", ANCESTRY, "_rsq7_nodup.bim ", final_name_rsq7, ".bim", sep = ""))
+system(paste("cp output/", DATA_NAME, "_", ANCESTRY, "_rsq7_nodup.fam ", final_name_rsq7, ".fam", sep = ""))
 
-## Keep only unique variants
-keepers <- bim[!(duplicated(bim$V2) | duplicated(bim$V2, fromLast = TRUE)), ]
-dups <- bim[(duplicated(bim$V2) | duplicated(bim$V2, fromLast = TRUE)), ]
+# ==============================================================================
+# COMPLETION MESSAGE
+# ==============================================================================
 
-fwrite(keepers[, 2], "unique_markers_rsq3.txt", row.names = FALSE, col.names = FALSE, quote = FALSE, sep = " ")
-
-## Remove duplicates
-system("plink --bfile data_ancestry_imputed_rsq3 --extract unique_markers_rsq3.txt --make-bed --out data_ancestry_imputed_rsq3_nodup")
-
-## ============================================================================
-## FINAL FILE
-## ============================================================================
-
-## data_ancestry_imputed_rsq3_nodup.{bed,bim,fam} is ready for analysis
-system("plink --bfile data_ancestry_imputed_rsq3 --make-bed --out FINAL_NAME_TBD")
+cat("\n")
+cat("========================================\n")
+cat("✓ POST-IMPUTATION PIPELINE COMPLETE!\n")
+cat("========================================\n")
+cat("\nOutput files:\n")
+cat("  - High coverage (Rsq>0.3):", final_name_rsq3, "{bed,bim,fam}\n")
+cat("  - High quality (Rsq>0.7):", final_name_rsq7, "{bed,bim,fam}\n")
+cat("  - Summary table: summary_tables/", DATA_NAME, "_", ANCESTRY, "_imputation_summary.csv\n", sep = "")
+cat("\nRecommended Rsq threshold for analysis:\n")
+cat("  - GWAS: Rsq > 0.7\n")
+cat("  - Fine-mapping: Rsq > 0.9\n")
+cat("  - Exploratory: Rsq > 0.3\n")
+cat("\n========================================\n")
